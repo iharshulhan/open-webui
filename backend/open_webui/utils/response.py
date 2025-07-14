@@ -26,15 +26,33 @@ def _tool(rsp_call: dict) -> dict:
 
 def rsp_to_cca(rsp: dict) -> dict:
     """Convert Response object → synthetic Chat‑Completions object"""
+    log.debug(f"Converting Response API response to CCA format: {rsp}")
+    
     latest = rsp["output"][-1]
+    
+    # Extract content with better handling of different formats
+    content = ""
+    if "content" in latest:
+        if isinstance(latest["content"], str):
+            # Direct string content
+            content = latest["content"]
+        elif isinstance(latest["content"], list):
+            # Array of content parts
+            content = "".join(
+                p.get("text", "") for p in latest["content"] 
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+    
     chat_msg = {
         "role": latest["role"],
-        "content": "".join(
-            p["text"] for p in latest.get("content", []) if p["type"] == "output_text"
-        )
+        "content": content
     }
-    if latest["type"] == "tool_call":
+    
+    # Handle tool calls
+    if latest.get("type") == "tool_call":
         chat_msg["tool_calls"] = [_tool(latest)]
+    
+    log.debug(f"Converted message: {chat_msg}")
 
     return {
         "id": rsp["id"],
@@ -72,7 +90,7 @@ async def rsp_sse_to_cca(response_content):
                     # Handle Response API events
                     if 'event' in data:
                         event_type = data['event']
-                        if event_type == "response.output_text.delta":
+                        if event_type == "response.text.delta":
                             content = data.get('data', {}).get('delta', '')
                             yield f"data: {json.dumps({'choices': [{'delta': {'content': content}}]})}\n\n"
                         elif event_type == "response.tool_call.partial":
