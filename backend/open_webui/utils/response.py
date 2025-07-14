@@ -1,9 +1,108 @@
 import json
+import asyncio
+import logging
 from uuid import uuid4
 from open_webui.utils.misc import (
     openai_chat_chunk_message_template,
     openai_chat_completion_message_template,
 )
+
+log = logging.getLogger(__name__)
+
+
+# OpenAI Response API Transformation Functions
+
+def _tool(rsp_call: dict) -> dict:
+    """Convert RSP tool_call → CCA tool_call."""
+    return {
+        "id": rsp_call.get("id"),
+        "type": "function",
+        "function": {
+            "name": rsp_call.get("name"),
+            "arguments": rsp_call.get("arguments")
+        }
+    }
+
+
+def rsp_to_cca(rsp: dict) -> dict:
+    """Convert Response object → synthetic Chat‑Completions object"""
+    latest = rsp["output"][-1]
+    chat_msg = {
+        "role": latest["role"],
+        "content": "".join(
+            p["text"] for p in latest.get("content", []) if p["type"] == "output_text"
+        )
+    }
+    if latest["type"] == "tool_call":
+        chat_msg["tool_calls"] = [_tool(latest)]
+
+    return {
+        "id": rsp["id"],
+        "object": "chat.completion",
+        "created": rsp["created_at"],
+        "model": rsp["model"],
+        "choices": [{
+            "index": 0,
+            "message": chat_msg,
+            "finish_reason": "stop"
+        }],
+        "usage": rsp.get("usage", {})
+    }
+
+
+def _wrap(x):
+    """Wrap delta content for CCA format"""
+    return f"data: {json.dumps({'choices': [x]})}\n\n"
+
+
+async def rsp_sse_to_cca(response_content):
+    """Convert Response API SSE events to CCA format"""
+    async for line in response_content:
+        try:
+            line_str = line.decode('utf-8').strip()
+            if line_str.startswith('data: '):
+                data_part = line_str[6:]  # Remove 'data: ' prefix
+                if data_part == '[DONE]':
+                    yield "data: [DONE]\n\n"
+                    continue
+                    
+                try:
+                    data = json.loads(data_part)
+                    
+                    # Handle Response API events
+                    if 'event' in data:
+                        event_type = data['event']
+                        if event_type == "response.output_text.delta":
+                            content = data.get('data', {}).get('delta', '')
+                            yield f"data: {json.dumps({'choices': [{'delta': {'content': content}}]})}\n\n"
+                        elif event_type == "response.tool_call.partial":
+                            call_data = data.get('data', {})
+                            tool_call = {
+                                "id": call_data.get("id"),
+                                "type": "function",
+                                "function": {
+                                    "name": call_data.get("name"),
+                                    "arguments": call_data.get("arguments")
+                                }
+                            }
+                            yield f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [tool_call]}}]})}\n\n"
+                        elif event_type == "response.done":
+                            yield "data: [DONE]\n\n"
+                        elif event_type == "response.error":
+                            error_data = data.get('data', {})
+                            yield f"data: {json.dumps({'error': error_data})}\n\n"
+                    else:
+                        # Pass through other events as-is
+                        yield line_str + "\n"
+                except json.JSONDecodeError:
+                    # Pass through non-JSON lines as-is
+                    yield line_str + "\n"
+            else:
+                # Pass through non-data lines as-is
+                yield line_str + "\n"
+        except Exception as e:
+            log.error(f"Error processing SSE line: {e}")
+            continue
 
 
 def convert_ollama_tool_call_to_openai(tool_calls: dict) -> dict:

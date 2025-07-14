@@ -437,6 +437,13 @@ else:
     except Exception:
         AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST = 10
 
+####################################
+# OpenAI Response API Configuration
+####################################
+
+# Enable Response API for all models (default True)
+USE_RSP_FOR_ALL = os.environ.get("USE_RSP_FOR_ALL", "True").lower() == "true"
+
 
 AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER_DATA = os.environ.get(
     "AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER_DATA", "10"

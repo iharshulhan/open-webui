@@ -359,6 +359,52 @@ def convert_payload_openai_to_ollama(openai_payload: dict) -> dict:
     return ollama_payload
 
 
+# OpenAI Response API Transformation Functions
+
+def cca_to_rsp(body: dict) -> dict:
+    """
+    Convert Chat Completions API (CCA) payload to Response API (RSP) format.
+    This implements the complete transformation as specified in the Response API guide.
+    """
+    out = {}
+    
+    # 1) Model + copy-through params first
+    out["model"] = body["model"]
+    for k in ("temperature", "top_p", "seed", "stream", "stop", "user",
+              "frequency_penalty", "presence_penalty", "response_format"):
+        if k in body:
+            out[k] = body[k]
+
+    # 2) max_tokens → max_output_tokens
+    if "max_tokens" in body:
+        out["max_output_tokens"] = body["max_tokens"]
+
+    # 3) system → instructions, others → input
+    msgs = body.get("messages", [])
+    sys_msgs = [m["content"] for m in msgs if m["role"] == "system"]
+    out["instructions"] = "\n".join(sys_msgs)
+    out["input"] = [m for m in msgs if m["role"] != "system"]
+
+    # 4) functions → tools
+    if "functions" in body:
+        out["tools"] = [
+            {"type": "function", "function": fn} for fn in body["functions"]
+        ]
+    elif "tools" in body:
+        # Pass through existing tools
+        out["tools"] = body["tools"]
+        
+    # 5) tool_choice passthrough
+    if "tool_choice" in body:
+        out["tool_choice"] = body["tool_choice"]
+
+    # 6) reasoning_effort for o-series models
+    if "reasoning_effort" in body:
+        out["reasoning_effort"] = body["reasoning_effort"]
+
+    return out
+
+
 def convert_embedding_payload_openai_to_ollama(openai_payload: dict) -> dict:
     """
     Convert an embeddings request payload from OpenAI format to Ollama format.

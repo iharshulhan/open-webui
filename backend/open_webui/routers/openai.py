@@ -26,6 +26,7 @@ from open_webui.env import (
     AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST,
     ENABLE_FORWARD_USER_INFO_HEADERS,
     BYPASS_MODEL_ACCESS_CONTROL,
+    USE_RSP_FOR_ALL,
 )
 from open_webui.models.users import UserModel
 
@@ -36,6 +37,11 @@ from open_webui.env import ENV, SRC_LOG_LEVELS
 from open_webui.utils.payload import (
     apply_model_params_to_body_openai,
     apply_model_system_prompt_to_body,
+    cca_to_rsp,
+)
+from open_webui.utils.response import (
+    rsp_to_cca,
+    rsp_sse_to_cca,
 )
 from open_webui.utils.misc import (
     convert_logit_bias_input_to_json,
@@ -97,23 +103,25 @@ async def cleanup_response(
 def should_use_response_api(model: str) -> bool:
     """
     Determine if the model should use the Response API endpoint.
-    Response API is used for o3-pro models to enable enhanced reasoning capabilities.
+    - If USE_RSP_FOR_ALL is True, all models use Response API
+    - Otherwise, only o3-pro models use Response API for enhanced reasoning capabilities
     """
+    if USE_RSP_FOR_ALL:
+        return True
+    
     model_lower = model.lower()
     return model_lower.startswith("o3-pro")
 
 
-def get_chat_completions_endpoint(url: str, model: str, api_config: dict) -> str:
+def get_openai_endpoint(url: str, model: str, api_config: dict) -> str:
     """
-    Get the appropriate chat completions endpoint based on model type and configuration.
+    Get the appropriate OpenAI endpoint based on model type and configuration.
+    Supports both Chat Completions API and Response API routing.
     """
     if api_config.get("azure", False):
         # Azure OpenAI endpoint
-        model_for_url = model
         api_version = api_config.get("api_version", "") or "2023-03-15-preview"
-
-        return f"{url}/openai/v1/responses?api-version=preview"
-        # Use Response API for o3-pro models on Azure
+        
         if should_use_response_api(model):
             return f"{url}/openai/v1/responses?api-version=preview"
         else:
@@ -121,7 +129,7 @@ def get_chat_completions_endpoint(url: str, model: str, api_config: dict) -> str
     else:
         # Direct OpenAI or compatible endpoint
         if should_use_response_api(model):
-            return f"{url}/responses"
+            return f"{url}/v1/responses"
         else:
             return f"{url}/chat/completions"
 
@@ -173,23 +181,19 @@ def openai_o_series_handler(payload):
     return payload
 
 
-def convert_payload_to_response_api(payload):
+def prepare_payload_for_api(payload: dict, use_response_api: bool = False) -> dict:
     """
-    Convert the payload to the format expected by the Response API.
+    Prepare payload for either Chat Completions API or Response API.
     """
-    payload["input"] = payload.get("messages", payload.get("input", ""))
-    payload.pop("messages", None)
-    payload["model"] = payload.get("model", "").lower()
-    payload["reasoning"] = {
-        "effort": payload.get("reasoning_effort", "medium"),
-    }
-    payload.pop("reasoning_effort", None)
-    if "max_completion_tokens" in payload:
-        # Convert max_completion_tokens to max_output_tokens for o-series models
-        payload["max_output_tokens"] = payload.get("max_completion_tokens")
-        del payload["max_completion_tokens"]
+    if use_response_api:
+        # Transform to Response API format
+        return cca_to_rsp(payload)
+    else:
+        # Keep Chat Completions API format
+        return payload
 
-    return payload
+
+
 
 ##########################################
 #
@@ -745,8 +749,9 @@ def convert_to_azure_payload(
         "max_completion_tokens",
         "reasoning_effort",  # Added for o3-pro Response API support
         "model",
-        "input",
-        "max_output_tokens",
+        "input",            # Response API field
+        "max_output_tokens", # Response API field
+        "instructions",     # Response API field
     }
 
     # Special handling for o-series models
@@ -898,6 +903,7 @@ async def generate_chat_completion(
     }
 
     model_name = payload.get("model", "")
+    use_response_api = should_use_response_api(model_name)
     
     if api_config.get("azure", False):
         request_url, payload = convert_to_azure_payload(url, payload)
@@ -905,15 +911,14 @@ async def generate_chat_completion(
         headers["api-key"] = key
         headers["api-version"] = api_version
         # Use the helper function to get the correct endpoint
-        request_url = get_chat_completions_endpoint(url, model_name, api_config)
+        request_url = get_openai_endpoint(url, model_name, api_config)
     else:
         # Use the helper function to get the correct endpoint
-        request_url = get_chat_completions_endpoint(url, model_name, api_config)
+        request_url = get_openai_endpoint(url, model_name, api_config)
         headers["Authorization"] = f"Bearer {key}"
 
-    if should_use_response_api(model_name):
-        # Convert payload to Response API format
-        payload = convert_payload_to_response_api(payload)
+    # Prepare payload for the appropriate API
+    payload = prepare_payload_for_api(payload, use_response_api)
         
     payload = json.dumps(payload)
 
@@ -941,14 +946,25 @@ async def generate_chat_completion(
         # Check if response is SSE
         if "text/event-stream" in r.headers.get("Content-Type", ""):
             streaming = True
-            return StreamingResponse(
-                r.content,
-                status_code=r.status,
-                headers=dict(r.headers),
-                background=BackgroundTask(
-                    cleanup_response, response=r, session=session
-                ),
-            )
+            if use_response_api:
+                # Convert Response API SSE to Chat Completions format
+                return StreamingResponse(
+                    rsp_sse_to_cca(r.content),
+                    status_code=r.status,
+                    headers={"Content-Type": "text/event-stream"},
+                    background=BackgroundTask(
+                        cleanup_response, response=r, session=session
+                    ),
+                )
+            else:
+                return StreamingResponse(
+                    r.content,
+                    status_code=r.status,
+                    headers=dict(r.headers),
+                    background=BackgroundTask(
+                        cleanup_response, response=r, session=session
+                    ),
+                )
         else:
             try:
                 response = await r.json()
@@ -957,6 +973,11 @@ async def generate_chat_completion(
                 response = await r.text()
             log.info(f"Response: {response}")
             r.raise_for_status()
+            
+            # Convert Response API response to Chat Completions format if needed
+            if use_response_api and isinstance(response, dict) and "output" in response:
+                response = rsp_to_cca(response)
+            
             return response
     except Exception as e:
         log.exception(e)
