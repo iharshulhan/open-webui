@@ -94,23 +94,80 @@ async def cleanup_response(
         await session.close()
 
 
+def should_use_response_api(model: str) -> bool:
+    """
+    Determine if the model should use the Response API endpoint.
+    Response API is used for o3-pro models to enable enhanced reasoning capabilities.
+    """
+    model_lower = model.lower()
+    return model_lower.startswith("o3-pro")
+
+
+def get_chat_completions_endpoint(url: str, model: str, api_config: dict) -> str:
+    """
+    Get the appropriate chat completions endpoint based on model type and configuration.
+    """
+    if api_config.get("azure", False):
+        # Azure OpenAI endpoint
+        model_for_url = model
+        api_version = api_config.get("api_version", "") or "2023-03-15-preview"
+        
+        # Use Response API for o3-pro models on Azure
+        if should_use_response_api(model):
+            return f"{url}/openai/deployments/{model_for_url}/responses?api-version={api_version}"
+        else:
+            return f"{url}/openai/deployments/{model_for_url}/chat/completions?api-version={api_version}"
+    else:
+        # Direct OpenAI or compatible endpoint
+        if should_use_response_api(model):
+            return f"{url}/responses"
+        else:
+            return f"{url}/chat/completions"
+
+
 def openai_o_series_handler(payload):
     """
-    Handle "o" series specific parameters
+    Handle "o" series specific parameters including Response API support for o3-pro
     """
+    model_lower = payload["model"].lower()
+    
     if "max_tokens" in payload:
         # Convert "max_tokens" to "max_completion_tokens" for all o-series models
         payload["max_completion_tokens"] = payload["max_tokens"]
         del payload["max_tokens"]
 
     # Handle system role conversion based on model type
-    if payload["messages"][0]["role"] == "system":
-        model_lower = payload["model"].lower()
+    if payload.get("messages") and len(payload["messages"]) > 0 and payload["messages"][0]["role"] == "system":
         # Legacy models use "user" role instead of "system"
         if model_lower.startswith("o1-mini") or model_lower.startswith("o1-preview"):
             payload["messages"][0]["role"] = "user"
         else:
+            # o3-pro and other newer models use "developer" role
             payload["messages"][0]["role"] = "developer"
+    
+    # Handle o3-pro specific Response API parameters
+    if model_lower.startswith("o3-pro"):
+        # Remove unsupported parameters for o3-pro model
+        unsupported_params = ["temperature", "top_p", "frequency_penalty", "presence_penalty", "logit_bias"]
+        for param in unsupported_params:
+            if param in payload:
+                log.debug(f"Removing unsupported parameter '{param}' for o3-pro model")
+                del payload[param]
+        
+        # Ensure reasoning_effort is properly handled for o3-pro
+        if "reasoning_effort" not in payload:
+            # Set default reasoning effort for o3-pro if not specified
+            payload["reasoning_effort"] = "medium"
+        elif payload["reasoning_effort"] not in ["low", "medium", "high"]:
+            log.debug(f"Invalid reasoning_effort value, setting to medium for o3-pro model")
+            payload["reasoning_effort"] = "medium"
+    
+    # Remove temperature for all o-series models if not 1 (or if o3-pro)
+    if "temperature" in payload:
+        if model_lower.startswith("o3-pro") or (payload["temperature"] != 1):
+            if not model_lower.startswith("o3-pro"):
+                log.debug(f"Removing temperature parameter for o-series model as only default value (1) is supported")
+            del payload["temperature"]
 
     return payload
 
@@ -667,21 +724,23 @@ def convert_to_azure_payload(
         "response_format",
         "seed",
         "max_completion_tokens",
+        "reasoning_effort",  # Added for o3-pro Response API support
     }
 
     # Special handling for o-series models
-    if model.startswith("o") and model.endswith("-mini"):
+    if model.startswith("o1") or model.startswith("o3") or model.startswith("o4"):
         # Convert max_tokens to max_completion_tokens for o-series models
         if "max_tokens" in payload:
             payload["max_completion_tokens"] = payload["max_tokens"]
             del payload["max_tokens"]
 
-        # Remove temperature if not 1 for o-series models
-        if "temperature" in payload and payload["temperature"] != 1:
-            log.debug(
-                f"Removing temperature parameter for o-series model {model} as only default value (1) is supported"
-            )
-            del payload["temperature"]
+        # Remove temperature if not 1 for o-series models (except o3-pro which doesn't support it at all)
+        if "temperature" in payload:
+            if model.startswith("o3-pro") or payload["temperature"] != 1:
+                log.debug(
+                    f"Removing temperature parameter for o-series model {model} as only default value (1) is supported or not supported at all"
+                )
+                del payload["temperature"]
 
     # Filter out unsupported parameters
     payload = {k: v for k, v in payload.items() if k in allowed_params}
@@ -816,14 +875,18 @@ async def generate_chat_completion(
         ),
     }
 
+    model_name = payload.get("model", "")
+    
     if api_config.get("azure", False):
         request_url, payload = convert_to_azure_payload(url, payload)
         api_version = api_config.get("api_version", "") or "2023-03-15-preview"
         headers["api-key"] = key
         headers["api-version"] = api_version
-        request_url = f"{request_url}/chat/completions?api-version={api_version}"
+        # Use the helper function to get the correct endpoint
+        request_url = get_chat_completions_endpoint(url, model_name, api_config)
     else:
-        request_url = f"{url}/chat/completions"
+        # Use the helper function to get the correct endpoint
+        request_url = get_chat_completions_endpoint(url, model_name, api_config)
         headers["Authorization"] = f"Bearer {key}"
 
     payload = json.dumps(payload)
