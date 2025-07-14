@@ -111,12 +111,13 @@ def get_chat_completions_endpoint(url: str, model: str, api_config: dict) -> str
         # Azure OpenAI endpoint
         model_for_url = model
         api_version = api_config.get("api_version", "") or "2023-03-15-preview"
-        
+
+        return f"{url}/openai/v1/responses?api-version=preview"
         # Use Response API for o3-pro models on Azure
         if should_use_response_api(model):
-            return f"{url}/openai/deployments/{model_for_url}/responses?api-version={api_version}"
+            return f"{url}/openai/v1/responses?api-version=preview"
         else:
-            return f"{url}/openai/deployments/{model_for_url}/chat/completions?api-version={api_version}"
+            return f"{url}/openai/chat/completions?api-version={api_version}"
     else:
         # Direct OpenAI or compatible endpoint
         if should_use_response_api(model):
@@ -171,6 +172,24 @@ def openai_o_series_handler(payload):
 
     return payload
 
+
+def convert_payload_to_response_api(payload):
+    """
+    Convert the payload to the format expected by the Response API.
+    """
+    payload["input"] = payload.get("messages", payload.get("input", ""))
+    payload.pop("messages", None)
+    payload["model"] = payload.get("model", "").lower()
+    payload["reasoning"] = {
+        "effort": payload.get("reasoning_effort", "medium"),
+    }
+    payload.pop("reasoning_effort", None)
+    if "max_completion_tokens" in payload:
+        # Convert max_completion_tokens to max_output_tokens for o-series models
+        payload["max_output_tokens"] = payload.get("max_completion_tokens")
+        del payload["max_completion_tokens"]
+
+    return payload
 
 ##########################################
 #
@@ -725,6 +744,9 @@ def convert_to_azure_payload(
         "seed",
         "max_completion_tokens",
         "reasoning_effort",  # Added for o3-pro Response API support
+        "model",
+        "input",
+        "max_output_tokens",
     }
 
     # Special handling for o-series models
@@ -889,6 +911,10 @@ async def generate_chat_completion(
         request_url = get_chat_completions_endpoint(url, model_name, api_config)
         headers["Authorization"] = f"Bearer {key}"
 
+    if should_use_response_api(model_name):
+        # Convert payload to Response API format
+        payload = convert_payload_to_response_api(payload)
+        
     payload = json.dumps(payload)
 
     r = None
@@ -908,7 +934,10 @@ async def generate_chat_completion(
             headers=headers,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
         )
-
+        log.info(f"Request URL: {request_url}")
+        log.info(f"Request Headers: {headers}")
+        log.info(f"Request Payload: {payload}")
+        
         # Check if response is SSE
         if "text/event-stream" in r.headers.get("Content-Type", ""):
             streaming = True
@@ -926,7 +955,7 @@ async def generate_chat_completion(
             except Exception as e:
                 log.error(e)
                 response = await r.text()
-
+            log.info(f"Response: {response}")
             r.raise_for_status()
             return response
     except Exception as e:
