@@ -372,20 +372,25 @@ async def chat_web_search_handler(
             user,
         )
 
-        response = res["choices"][0]["message"]["content"]
+        if res and isinstance(res, dict) and "choices" in res:
+            response = res["choices"][0]["message"]["content"]
 
-        try:
-            bracket_start = response.find("{")
-            bracket_end = response.rfind("}") + 1
+            try:
+                bracket_start = response.find("{")
+                bracket_end = response.rfind("}") + 1
 
-            if bracket_start == -1 or bracket_end == -1:
-                raise Exception("No JSON object found in the response")
+                if bracket_start == -1 or bracket_end == -1:
+                    raise Exception("No JSON object found in the response")
 
-            response = response[bracket_start:bracket_end]
-            queries = json.loads(response)
-            queries = queries.get("queries", [])
-        except Exception as e:
-            queries = [response]
+                response = response[bracket_start:bracket_end]
+                queries = json.loads(response)
+                queries = queries.get("queries", [])
+            except Exception as e:
+                queries = [response]
+        else:
+            # Handle JSONResponse or other error cases
+            log.warning(f"Invalid response from generate_queries: {type(res)}")
+            queries = [user_message]
 
     except Exception as e:
         log.exception(e)
@@ -528,19 +533,24 @@ async def chat_image_generation_handler(
                 user,
             )
 
-            response = res["choices"][0]["message"]["content"]
+            if res and isinstance(res, dict) and "choices" in res:
+                response = res["choices"][0]["message"]["content"]
 
-            try:
-                bracket_start = response.find("{")
-                bracket_end = response.rfind("}") + 1
+                try:
+                    bracket_start = response.find("{")
+                    bracket_end = response.rfind("}") + 1
 
-                if bracket_start == -1 or bracket_end == -1:
-                    raise Exception("No JSON object found in the response")
+                    if bracket_start == -1 or bracket_end == -1:
+                        raise Exception("No JSON object found in the response")
 
-                response = response[bracket_start:bracket_end]
-                response = json.loads(response)
-                prompt = response.get("prompt", [])
-            except Exception as e:
+                    response = response[bracket_start:bracket_end]
+                    response = json.loads(response)
+                    prompt = response.get("prompt", [])
+                except Exception as e:
+                    prompt = user_message
+            else:
+                # Handle JSONResponse or other error cases
+                log.warning(f"Invalid response from generate_image_prompt: {type(res)}")
                 prompt = user_message
 
         except Exception as e:
@@ -618,21 +628,26 @@ async def chat_completion_files_handler(
                 },
                 user,
             )
-            queries_response = queries_response["choices"][0]["message"]["content"]
+            if queries_response and isinstance(queries_response, dict) and "choices" in queries_response:
+                queries_response = queries_response["choices"][0]["message"]["content"]
 
-            try:
-                bracket_start = queries_response.find("{")
-                bracket_end = queries_response.rfind("}") + 1
+                try:
+                    bracket_start = queries_response.find("{")
+                    bracket_end = queries_response.rfind("}") + 1
 
-                if bracket_start == -1 or bracket_end == -1:
-                    raise Exception("No JSON object found in the response")
+                    if bracket_start == -1 or bracket_end == -1:
+                        raise Exception("No JSON object found in the response")
 
-                queries_response = queries_response[bracket_start:bracket_end]
-                queries_response = json.loads(queries_response)
-            except Exception as e:
-                queries_response = {"queries": [queries_response]}
+                    queries_response = queries_response[bracket_start:bracket_end]
+                    queries_response = json.loads(queries_response)
+                except Exception as e:
+                    queries_response = {"queries": [queries_response]}
 
-            queries = queries_response.get("queries", [])
+                queries = queries_response.get("queries", [])
+            else:
+                # Handle JSONResponse or other error cases
+                log.warning(f"Invalid response from generate_queries: {type(queries_response)}")
+                queries = []
         except:
             pass
 

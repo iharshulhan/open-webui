@@ -26,6 +26,7 @@ from open_webui.env import (
     AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST,
     ENABLE_FORWARD_USER_INFO_HEADERS,
     BYPASS_MODEL_ACCESS_CONTROL,
+    USE_RSP_FOR_ALL,
 )
 from open_webui.models.users import UserModel
 
@@ -36,6 +37,11 @@ from open_webui.env import ENV, SRC_LOG_LEVELS
 from open_webui.utils.payload import (
     apply_model_params_to_body_openai,
     apply_model_system_prompt_to_body,
+    cca_to_rsp,
+)
+from open_webui.utils.response import (
+    rsp_to_cca,
+    rsp_sse_to_cca,
 )
 from open_webui.utils.misc import (
     convert_logit_bias_input_to_json,
@@ -94,25 +100,99 @@ async def cleanup_response(
         await session.close()
 
 
+def should_use_response_api(model: str) -> bool:
+    """
+    Determine if the model should use the Response API endpoint.
+    - If USE_RSP_FOR_ALL is True, all models use Response API
+    - Otherwise, only o3-pro models use Response API for enhanced reasoning capabilities
+    """
+    if USE_RSP_FOR_ALL:
+        return True
+    
+    model_lower = model.lower()
+    return model_lower.startswith("o3-pro")
+
+
+def get_openai_endpoint(url: str, model: str, api_config: dict) -> str:
+    """
+    Get the appropriate OpenAI endpoint based on model type and configuration.
+    Supports both Chat Completions API and Response API routing.
+    """
+    if api_config.get("azure", False):
+        # Azure OpenAI endpoint
+        api_version = api_config.get("api_version", "") or "2023-03-15-preview"
+        
+        if should_use_response_api(model):
+            return f"{url}/openai/v1/responses?api-version=preview"
+        else:
+            return f"{url}/openai/chat/completions?api-version={api_version}"
+    else:
+        # Direct OpenAI or compatible endpoint
+        if should_use_response_api(model):
+            return f"{url}/v1/responses"
+        else:
+            return f"{url}/chat/completions"
+
+
 def openai_o_series_handler(payload):
     """
-    Handle "o" series specific parameters
+    Handle "o" series specific parameters including Response API support for o3-pro
     """
+    model_lower = payload["model"].lower()
+    
     if "max_tokens" in payload:
         # Convert "max_tokens" to "max_completion_tokens" for all o-series models
         payload["max_completion_tokens"] = payload["max_tokens"]
         del payload["max_tokens"]
 
     # Handle system role conversion based on model type
-    if payload["messages"][0]["role"] == "system":
-        model_lower = payload["model"].lower()
+    if payload.get("messages") and len(payload["messages"]) > 0 and payload["messages"][0]["role"] == "system":
         # Legacy models use "user" role instead of "system"
         if model_lower.startswith("o1-mini") or model_lower.startswith("o1-preview"):
             payload["messages"][0]["role"] = "user"
         else:
+            # o3-pro and other newer models use "developer" role
             payload["messages"][0]["role"] = "developer"
+    
+    # Handle o3-pro specific Response API parameters
+    if model_lower.startswith("o3-pro"):
+        # Remove unsupported parameters for o3-pro model
+        unsupported_params = ["temperature", "top_p", "frequency_penalty", "presence_penalty", "logit_bias"]
+        for param in unsupported_params:
+            if param in payload:
+                log.debug(f"Removing unsupported parameter '{param}' for o3-pro model")
+                del payload[param]
+        
+        # Ensure reasoning_effort is properly handled for o3-pro
+        if "reasoning_effort" not in payload:
+            # Set default reasoning effort for o3-pro if not specified
+            payload["reasoning_effort"] = "medium"
+        elif payload["reasoning_effort"] not in ["low", "medium", "high"]:
+            log.debug(f"Invalid reasoning_effort value, setting to medium for o3-pro model")
+            payload["reasoning_effort"] = "medium"
+    
+    # Remove temperature for all o-series models if not 1 (or if o3-pro)
+    if "temperature" in payload:
+        if model_lower.startswith("o3-pro") or (payload["temperature"] != 1):
+            if not model_lower.startswith("o3-pro"):
+                log.debug(f"Removing temperature parameter for o-series model as only default value (1) is supported")
+            del payload["temperature"]
 
     return payload
+
+
+def prepare_payload_for_api(payload: dict, use_response_api: bool = False) -> dict:
+    """
+    Prepare payload for either Chat Completions API or Response API.
+    """
+    if use_response_api:
+        # Transform to Response API format
+        return cca_to_rsp(payload)
+    else:
+        # Keep Chat Completions API format
+        return payload
+
+
 
 
 ##########################################
@@ -667,21 +747,27 @@ def convert_to_azure_payload(
         "response_format",
         "seed",
         "max_completion_tokens",
+        "reasoning_effort",  # Added for o3-pro Response API support
+        "model",
+        "input",            # Response API field
+        "max_output_tokens", # Response API field
+        "instructions",     # Response API field
     }
 
     # Special handling for o-series models
-    if model.startswith("o") and model.endswith("-mini"):
+    if model.startswith("o1") or model.startswith("o3") or model.startswith("o4"):
         # Convert max_tokens to max_completion_tokens for o-series models
         if "max_tokens" in payload:
             payload["max_completion_tokens"] = payload["max_tokens"]
             del payload["max_tokens"]
 
-        # Remove temperature if not 1 for o-series models
-        if "temperature" in payload and payload["temperature"] != 1:
-            log.debug(
-                f"Removing temperature parameter for o-series model {model} as only default value (1) is supported"
-            )
-            del payload["temperature"]
+        # Remove temperature if not 1 for o-series models (except o3-pro which doesn't support it at all)
+        if "temperature" in payload:
+            if model.startswith("o3-pro") or payload["temperature"] != 1:
+                log.debug(
+                    f"Removing temperature parameter for o-series model {model} as only default value (1) is supported or not supported at all"
+                )
+                del payload["temperature"]
 
     # Filter out unsupported parameters
     payload = {k: v for k, v in payload.items() if k in allowed_params}
@@ -816,16 +902,24 @@ async def generate_chat_completion(
         ),
     }
 
+    model_name = payload.get("model", "")
+    use_response_api = should_use_response_api(model_name)
+    
     if api_config.get("azure", False):
         request_url, payload = convert_to_azure_payload(url, payload)
         api_version = api_config.get("api_version", "") or "2023-03-15-preview"
         headers["api-key"] = key
         headers["api-version"] = api_version
-        request_url = f"{request_url}/chat/completions?api-version={api_version}"
+        # Use the helper function to get the correct endpoint
+        request_url = get_openai_endpoint(url, model_name, api_config)
     else:
-        request_url = f"{url}/chat/completions"
+        # Use the helper function to get the correct endpoint
+        request_url = get_openai_endpoint(url, model_name, api_config)
         headers["Authorization"] = f"Bearer {key}"
 
+    # Prepare payload for the appropriate API
+    payload = prepare_payload_for_api(payload, use_response_api)
+        
     payload = json.dumps(payload)
 
     r = None
@@ -845,26 +939,45 @@ async def generate_chat_completion(
             headers=headers,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
         )
-
+        log.info(f"Request URL: {request_url}")
+        log.info(f"Request Headers: {headers}")
+        log.info(f"Request Payload: {payload}")
+        
         # Check if response is SSE
         if "text/event-stream" in r.headers.get("Content-Type", ""):
             streaming = True
-            return StreamingResponse(
-                r.content,
-                status_code=r.status,
-                headers=dict(r.headers),
-                background=BackgroundTask(
-                    cleanup_response, response=r, session=session
-                ),
-            )
+            if use_response_api:
+                # Convert Response API SSE to Chat Completions format
+                return StreamingResponse(
+                    rsp_sse_to_cca(r.content),
+                    status_code=r.status,
+                    headers={"Content-Type": "text/event-stream"},
+                    background=BackgroundTask(
+                        cleanup_response, response=r, session=session
+                    ),
+                )
+            else:
+                return StreamingResponse(
+                    r.content,
+                    status_code=r.status,
+                    headers=dict(r.headers),
+                    background=BackgroundTask(
+                        cleanup_response, response=r, session=session
+                    ),
+                )
         else:
             try:
                 response = await r.json()
             except Exception as e:
                 log.error(e)
                 response = await r.text()
-
+            log.info(f"Response: {response}")
             r.raise_for_status()
+            
+            # Convert Response API response to Chat Completions format if needed
+            if use_response_api and isinstance(response, dict) and "output" in response:
+                response = rsp_to_cca(response)
+            
             return response
     except Exception as e:
         log.exception(e)
